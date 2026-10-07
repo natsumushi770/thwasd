@@ -1,0 +1,21 @@
+import { Button } from "std-widgets.slint";
+
+export component ControlPanel inherits Window {
+    title: "Touhou WASD";
+    width: 260px;
+    height: 112px;
+
+    in-out property <bool> remapping-enabled: false;
+    callback enabled-changed(bool);
+
+    VerticalLayout {
+        padding: 24px;
+        Button {
+            text: root.remapping-enabled ? "Remap: ON" : "Remap: OFF";
+            checkable: true;
+            checked <=> root.remapping-enabled;
+            clicked => { root.enabled-changed(self.checked); }
+        }
+    }
+}
+
