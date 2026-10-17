@@ -38,6 +38,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
+/// 非同期のウィンドウ操作や入力配送が完了するまで待つ。タイムアウトの位置は呼び出し元として報告する。
 #[track_caller]
 fn wait_until(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -54,6 +55,7 @@ fn control_panel_starts_minimizes_restores_and_exits() {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .unwrap();
+    // 検証中にパニックが起きても、子プロセスを終了させてからパニックを再開する。
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let title = wide("Touhou WASD");
         let mut window = null_mut();
@@ -64,13 +66,14 @@ fn control_panel_starts_minimizes_restores_and_exits() {
             );
             let mut after = null_mut();
             loop {
-                // 安全性: 指定タイトルに一致する最上位ウィンドウだけを調べる。
+                // 安全性: NUL 終端のタイトルと直前の列挙結果を渡す。返されたハンドルの所有権は取得しない。
                 let candidate =
                     unsafe { FindWindowExW(null_mut(), after, null_mut(), title.as_ptr()) };
                 if candidate.is_null() {
                     return false;
                 }
                 let mut process_id = 0;
+                // 安全性: 列挙したウィンドウを指定し、書き込み先には有効なローカル変数を渡す。
                 unsafe {
                     GetWindowThreadProcessId(candidate, &mut process_id);
                 }
@@ -85,15 +88,19 @@ fn control_panel_starts_minimizes_restores_and_exits() {
         unsafe {
             PostMessageW(window, WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
         }
+        // 安全性: 管理下の子プロセスのウィンドウ状態を照会する。ハンドルの所有権は取得しない。
         wait_until(|| unsafe { IsIconic(window) } != 0);
         assert!(
             child.try_wait().unwrap().is_none(),
             "minimizing must not exit the app"
         );
+        // 安全性: 管理下の子プロセスのウィンドウへ、ポインターを含まない復元コマンドを送る。
         unsafe {
             PostMessageW(window, WM_SYSCOMMAND, SC_RESTORE as usize, 0);
         }
+        // 安全性: 管理下の子プロセスのウィンドウ状態だけを照会する。
         wait_until(|| unsafe { IsIconic(window) } == 0);
+        // 安全性: 管理下の子プロセスのウィンドウへ、ポインターを含まない終了通知を送る。
         unsafe {
             PostMessageW(window, WM_CLOSE, 0, 0);
         }
@@ -111,6 +118,7 @@ fn control_panel_starts_minimizes_restores_and_exits() {
     }
 }
 
+/// 指定したプロセス名で動く受信専用ウィンドウと、その受信ログを管理する。
 struct Fixture {
     child: Child,
     window: HWND,
@@ -119,6 +127,8 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// 同じテスト実行ファイルを指定名でコピーして起動し、プロセス名による対象判定を実際に通す。
+    /// 子プロセスでは input_window_fixture だけを実行し、独立したウィンドウへ入力を送れるようにする。
     fn start(name: &str) -> Self {
         let directory = std::env::current_dir()
             .unwrap()
@@ -156,16 +166,19 @@ impl Fixture {
         fixture
     }
 
+    /// 検証用ウィンドウを前面にし、フォーカス移動とその通知処理を待つ。
     fn activate(&self) {
         // 安全性: この検証用オブジェクトが、操作対象のウィンドウを作成したプロセスを管理している。
         unsafe {
             SetForegroundWindow(self.window);
         }
+        // 安全性: 引数のない照会で取得したハンドルを比較するだけで、所有権は取得しない。
         wait_until(|| unsafe { GetForegroundWindow() } == self.window);
         // テスト用キー入力を送る前に、非同期のアクティブウィンドウ変更通知の処理を待つ。
         thread::sleep(Duration::from_millis(50));
     }
 
+    /// 受信済みの (メッセージ種別, 仮想キーコード, スキャンコード, 拡張キーか) をログから読む。
     fn events(&self) -> Vec<(u32, u32, u32, bool)> {
         fs::read_to_string(&self.log)
             .unwrap_or_default()
@@ -180,6 +193,7 @@ impl Fixture {
             .collect()
     }
 
+    /// 期待数のイベントが届いてから少し待ち、余分なイベントも含めて受信列全体を比較する。
     fn expect_events(&self, expected: &[(u32, u32, u32, bool)]) {
         wait_until(|| self.events().len() >= expected.len());
         thread::sleep(Duration::from_millis(30));
@@ -202,14 +216,17 @@ impl Drop for Fixture {
     }
 }
 
+/// 指定ウィンドウが前面であることを確認し、外部入力として元キーの押下または解放を送る。
 fn input(window: HWND, key: u16, up: bool) {
     // ユーザーがフォーカスを切り替えても、無関係なアプリにテスト用キー入力を送らない。
+    // 安全性: 引数のない照会で取得したハンドルを比較するだけで、所有権は取得しない。
     assert_eq!(unsafe { GetForegroundWindow() }, window);
     let event = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: key,
+                // 安全性: テスト対象の有効な仮想キーコードを値で渡し、戻り値だけを使う。
                 wScan: unsafe { MapVirtualKeyW(key as u32, MAPVK_VK_TO_VSC) } as u16,
                 dwFlags: KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 },
                 time: 0,
@@ -224,6 +241,7 @@ fn input(window: HWND, key: u16, up: bool) {
     );
 }
 
+/// パニック時もテスト用キーの解放と、テスト前のフォーカスの復元を試みる後片付け。
 struct RestoreDesktop(HWND);
 
 impl Drop for RestoreDesktop {
@@ -255,6 +273,7 @@ impl Drop for RestoreDesktop {
 #[test]
 #[ignore = "uses foreground desktop windows and synthesized keyboard input; run explicitly"]
 fn remaps_only_foreground_targets_and_releases_held_keys() {
+    // 安全性: 引数のない照会で取得したハンドルを復元用に記録するだけで、所有権は取得しない。
     let _restore = RestoreDesktop(unsafe { GetForegroundWindow() });
     let other = Fixture::start("not-a-target.exe");
     let target = Fixture::start("東方紅魔郷.exe");
@@ -297,6 +316,7 @@ fn remaps_only_foreground_targets_and_releases_held_keys() {
         (WM_KEYDOWN, 0x26, 0x48, true),
     ]);
     target.expect_events(&expected);
+    // 安全性: 有効な仮想キーコードをコールバックの外で照会し、押下状態の最上位ビットだけを調べる。
     assert!(unsafe { GetAsyncKeyState(0x26) } < 0);
     assert!(unsafe { GetAsyncKeyState(0x5a) } < 0);
     service.set_enabled(false);
@@ -312,6 +332,7 @@ fn remaps_only_foreground_targets_and_releases_held_keys() {
     expected.push((WM_KEYDOWN, 0x10, 0x2a, false));
     target.expect_events(&expected);
     other.activate();
+    // 安全性: 左 Shift の有効な仮想キーコードをコールバックの外で照会する。
     wait_until(|| unsafe { GetAsyncKeyState(0xa0) } >= 0);
     input(other.window, b'L' as u16, true);
     input(other.window, b'W' as u16, false);
@@ -330,12 +351,14 @@ fn remaps_only_foreground_targets_and_releases_held_keys() {
     drop(service);
     expected.push((WM_KEYUP, 0x27, 0x4d, true));
     target.expect_events(&expected);
+    // 安全性: 右矢印の有効な仮想キーコードをコールバックの外で照会する。
     assert!(unsafe { GetAsyncKeyState(0x27) } >= 0);
     input(target.window, b'D' as u16, true);
     expected.push((WM_KEYUP, 0x44, 0x20, false));
     target.expect_events(&expected);
 }
 
+/// Fixture が子プロセスで実行する受信側。環境変数で指定されたウィンドウを作り、キーイベントを記録する。
 #[test]
 #[ignore = "child process fixture for the explicit Windows input integration test"]
 fn input_window_fixture() {
@@ -345,7 +368,7 @@ fn input_window_fixture() {
     let mut log = fs::File::create(std::env::var_os("TOUHOU_TEST_LOG").unwrap()).unwrap();
     let title = wide(&title);
     let class = wide("TouhouWASDInputFixture");
-    // 安全性: 静的なウィンドウプロシージャと、有効な NUL 終端のクラス名を渡す。
+    // 安全性: null は現在のプロセスのモジュールを指定する。返されたハンドルの所有権は取得しない。
     let module = unsafe { GetModuleHandleW(null_mut()) };
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(DefWindowProcW),
@@ -353,6 +376,7 @@ fn input_window_fixture() {
         lpszClassName: class.as_ptr(),
         ..Default::default()
     };
+    // 安全性: 構造体と NUL 終端のクラス名は有効で、ウィンドウプロシージャは静的な関数を指定する。
     assert_ne!(unsafe { RegisterClassW(&window_class) }, 0);
     // 安全性: 登録済みクラスと文字列は、ウィンドウ作成中も有効である。
     let window = unsafe {
@@ -373,7 +397,7 @@ fn input_window_fixture() {
     };
     assert!(!window.is_null());
     let mut message = MSG::default();
-    // 安全性: このスレッドが検証用ウィンドウとメッセージキューを作成し、所有している。
+    // 安全性: このスレッドが検証用ウィンドウとメッセージキューを所有し、MSG の出力先も有効である。
     unsafe {
         SetForegroundWindow(window);
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {

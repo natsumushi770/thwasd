@@ -1,5 +1,6 @@
 use super::domain::{KeyState, MAPPINGS, Output, Remapper, is_target_process};
 
+/// OS へ入力を送らず、送信成功を模擬してドメインが要求した出力だけを記録する。
 #[derive(Default)]
 struct Harness {
     remapper: Remapper,
