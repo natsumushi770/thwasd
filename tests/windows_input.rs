@@ -51,37 +51,38 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
 #[test]
 #[ignore = "briefly opens the application window; run explicitly on a Windows desktop"]
 fn control_panel_starts_minimizes_restores_and_exits() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_touhou-wasd"))
+    let mut app_process = Command::new(env!("CARGO_BIN_EXE_touhou-wasd"))
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .unwrap();
     // 検証中にパニックが起きても、子プロセスを終了させてからパニックを再開する。
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let title = wide("Touhou WASD");
         let mut window = null_mut();
         wait_until(|| {
             assert!(
-                child.try_wait().unwrap().is_none(),
+                app_process.try_wait().unwrap().is_none(),
                 "application exited before showing a window"
             );
-            let mut after = null_mut();
+            let mut previous_window = null_mut();
             loop {
                 // 安全性: NUL 終端のタイトルと直前の列挙結果を渡す。返されたハンドルの所有権は取得しない。
-                let candidate =
-                    unsafe { FindWindowExW(null_mut(), after, null_mut(), title.as_ptr()) };
-                if candidate.is_null() {
+                let candidate_window = unsafe {
+                    FindWindowExW(null_mut(), previous_window, null_mut(), title.as_ptr())
+                };
+                if candidate_window.is_null() {
                     return false;
                 }
                 let mut process_id = 0;
                 // 安全性: 列挙したウィンドウを指定し、書き込み先には有効なローカル変数を渡す。
                 unsafe {
-                    GetWindowThreadProcessId(candidate, &mut process_id);
+                    GetWindowThreadProcessId(candidate_window, &mut process_id);
                 }
-                if process_id == child.id() {
-                    window = candidate;
+                if process_id == app_process.id() {
+                    window = candidate_window;
                     return true;
                 }
-                after = candidate;
+                previous_window = candidate_window;
             }
         });
         // 安全性: このテストが起動したアプリのウィンドウにだけ、ウィンドウ操作コマンドを送る。
@@ -91,7 +92,7 @@ fn control_panel_starts_minimizes_restores_and_exits() {
         // 安全性: 管理下の子プロセスのウィンドウ状態を照会する。ハンドルの所有権は取得しない。
         wait_until(|| unsafe { IsIconic(window) } != 0);
         assert!(
-            child.try_wait().unwrap().is_none(),
+            app_process.try_wait().unwrap().is_none(),
             "minimizing must not exit the app"
         );
         // 安全性: 管理下の子プロセスのウィンドウへ、ポインターを含まない復元コマンドを送る。
@@ -106,56 +107,59 @@ fn control_panel_starts_minimizes_restores_and_exits() {
         }
         let mut exit_status = None;
         wait_until(|| {
-            exit_status = child.try_wait().unwrap();
+            exit_status = app_process.try_wait().unwrap();
             exit_status.is_some()
         });
         assert!(exit_status.unwrap().success());
     }));
-    let _ = child.kill();
-    let _ = child.wait();
-    if let Err(error) = result {
+    let _ = app_process.kill();
+    let _ = app_process.wait();
+    if let Err(error) = test_result {
         std::panic::resume_unwind(error);
     }
 }
 
 /// 指定したプロセス名で動く受信専用ウィンドウと、その受信ログを管理する。
-struct Fixture {
-    child: Child,
+struct InputWindowFixture {
+    fixture_process: Child,
     window: HWND,
-    executable: PathBuf,
-    log: PathBuf,
+    executable_path: PathBuf,
+    log_path: PathBuf,
 }
 
-impl Fixture {
+impl InputWindowFixture {
     /// 同じテスト実行ファイルを指定名でコピーして起動し、プロセス名による対象判定を実際に通す。
     /// 子プロセスでは input_window_fixture だけを実行し、独立したウィンドウへ入力を送れるようにする。
-    fn start(name: &str) -> Self {
-        let directory = std::env::current_dir()
+    fn start(process_name: &str) -> Self {
+        let fixture_directory = std::env::current_dir()
             .unwrap()
             .join("target")
             .join(format!("windows-input-{}", std::process::id(),));
-        fs::create_dir_all(&directory).unwrap();
-        let executable = directory.join(name);
-        let log = directory.join(format!("{name}.log"));
-        fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-        let title = wide(&format!("Touhou WASD test {} {name}", std::process::id()));
-        let child = Command::new(&executable)
+        fs::create_dir_all(&fixture_directory).unwrap();
+        let executable_path = fixture_directory.join(process_name);
+        let log_path = fixture_directory.join(format!("{process_name}.log"));
+        fs::copy(std::env::current_exe().unwrap(), &executable_path).unwrap();
+        let title = wide(&format!(
+            "Touhou WASD test {} {process_name}",
+            std::process::id()
+        ));
+        let fixture_process = Command::new(&executable_path)
             .args(["--ignored", "--exact", "input_window_fixture"])
             .env(
                 "TOUHOU_TEST_TITLE",
                 String::from_utf16_lossy(&title[..title.len() - 1]),
             )
-            .env("TOUHOU_TEST_LOG", &log)
+            .env("TOUHOU_TEST_LOG", &log_path)
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let mut fixture = Self {
-            child,
+            fixture_process,
             window: null_mut(),
-            executable,
-            log,
+            executable_path,
+            log_path,
         };
         wait_until(|| {
             // 安全性: 有効な NUL 終端のタイトルを渡す。返されたハンドルの所有権は取得しない。
@@ -180,55 +184,56 @@ impl Fixture {
 
     /// 受信済みの (メッセージ種別, 仮想キーコード, スキャンコード, 拡張キーか) をログから読む。
     fn events(&self) -> Vec<(u32, u32, u32, bool)> {
-        fs::read_to_string(&self.log)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let values: Vec<u32> = line
-                    .split_whitespace()
-                    .filter_map(|v| v.parse().ok())
-                    .collect();
-                (values.len() == 4).then(|| (values[0], values[1], values[2], values[3] != 0))
-            })
-            .collect()
+        let log_contents = fs::read_to_string(&self.log_path).unwrap_or_default();
+        let mut events = Vec::new();
+        for log_line in log_contents.lines() {
+            let event_fields: Vec<u32> = log_line
+                .split_whitespace()
+                .filter_map(|value| value.parse().ok())
+                .collect();
+            if let [message_type, virtual_key, scan_code, extended_flag] = event_fields.as_slice() {
+                events.push((*message_type, *virtual_key, *scan_code, *extended_flag != 0));
+            }
+        }
+        events
     }
 
     /// 期待数のイベントが届いてから少し待ち、余分なイベントも含めて受信列全体を比較する。
-    fn expect_events(&self, expected: &[(u32, u32, u32, bool)]) {
-        wait_until(|| self.events().len() >= expected.len());
+    fn expect_events(&self, expected_events: &[(u32, u32, u32, bool)]) {
+        wait_until(|| self.events().len() >= expected_events.len());
         thread::sleep(Duration::from_millis(30));
-        assert_eq!(self.events(), expected);
+        assert_eq!(self.events(), expected_events);
     }
 }
 
-impl Drop for Fixture {
+impl Drop for InputWindowFixture {
     fn drop(&mut self) {
         // 安全性: 管理下の検証用ウィンドウへ終了通知を送る。パニック時に備え、プロセスの強制終了も行う。
         unsafe {
             PostMessageW(self.window, WM_CLOSE, 0, 0);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = fs::remove_file(&self.executable);
-        let _ = fs::remove_file(&self.log);
+        let _ = self.fixture_process.kill();
+        let _ = self.fixture_process.wait();
+        let _ = fs::remove_file(&self.executable_path);
+        let _ = fs::remove_file(&self.log_path);
         // このテストが作成したディレクトリだけを、再帰せずに削除する。
-        let _ = fs::remove_dir(self.executable.parent().unwrap());
+        let _ = fs::remove_dir(self.executable_path.parent().unwrap());
     }
 }
 
 /// 指定ウィンドウが前面であることを確認し、外部入力として元キーの押下または解放を送る。
-fn input(window: HWND, key: u16, up: bool) {
+fn input(recipient_window: HWND, virtual_key: u16, is_key_up: bool) {
     // ユーザーがフォーカスを切り替えても、無関係なアプリにテスト用キー入力を送らない。
     // 安全性: 引数のない照会で取得したハンドルを比較するだけで、所有権は取得しない。
-    assert_eq!(unsafe { GetForegroundWindow() }, window);
-    let event = INPUT {
+    assert_eq!(unsafe { GetForegroundWindow() }, recipient_window);
+    let synthetic_input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: key,
+                wVk: virtual_key,
                 // 安全性: テスト対象の有効な仮想キーコードを値で渡し、戻り値だけを使う。
-                wScan: unsafe { MapVirtualKeyW(key as u32, MAPVK_VK_TO_VSC) } as u16,
-                dwFlags: KEYEVENTF_SCANCODE | if up { KEYEVENTF_KEYUP } else { 0 },
+                wScan: unsafe { MapVirtualKeyW(virtual_key as u32, MAPVK_VK_TO_VSC) } as u16,
+                dwFlags: KEYEVENTF_SCANCODE | if is_key_up { KEYEVENTF_KEYUP } else { 0 },
                 time: 0,
                 dwExtraInfo: 0,
             },
@@ -236,7 +241,7 @@ fn input(window: HWND, key: u16, up: bool) {
     };
     // 安全性: 初期化済みの INPUT は有効である。識別値 0 で、アプリ外部からのキー入力を模擬する。
     assert_eq!(
-        unsafe { SendInput(1, &event, size_of::<INPUT>() as i32) },
+        unsafe { SendInput(1, &synthetic_input, size_of::<INPUT>() as i32) },
         1
     );
 }
@@ -274,23 +279,23 @@ impl Drop for RestoreDesktop {
 #[ignore = "uses foreground desktop windows and synthesized keyboard input; run explicitly"]
 fn remaps_only_foreground_targets_and_releases_held_keys() {
     // 安全性: 引数のない照会で取得したハンドルを復元用に記録するだけで、所有権は取得しない。
-    let _restore = RestoreDesktop(unsafe { GetForegroundWindow() });
-    let other = Fixture::start("not-a-target.exe");
-    let target = Fixture::start("東方紅魔郷.exe");
+    let _desktop_restore = RestoreDesktop(unsafe { GetForegroundWindow() });
+    let non_target_fixture = InputWindowFixture::start("not-a-target.exe");
+    let target_fixture = InputWindowFixture::start("東方紅魔郷.exe");
     let service = RemappingService::start().unwrap();
 
     // OFF の間は、押下から解放まで元のキー入力をそのまま通す。
-    input(target.window, b'W' as u16, false);
-    input(target.window, b'W' as u16, true);
-    let mut expected = vec![
+    input(target_fixture.window, b'W' as u16, false);
+    input(target_fixture.window, b'W' as u16, true);
+    let mut expected_events = vec![
         (WM_KEYDOWN, 0x57, 0x11, false),
         (WM_KEYUP, 0x57, 0x11, false),
     ];
-    target.expect_events(&expected);
+    target_fixture.expect_events(&expected_events);
     service.set_enabled(true);
 
     // Win32 経由の各変換に、期待するスキャンコードと拡張キーフラグが設定されることを確認する。
-    for (source, destination, scan, extended) in [
+    for (source_key, destination_virtual_key, destination_scan_code, is_extended) in [
         (b'W', 0x26, 0x48, true),
         (b'A', 0x25, 0x4b, true),
         (b'S', 0x28, 0x50, true),
@@ -299,81 +304,91 @@ fn remaps_only_foreground_targets_and_releases_held_keys() {
         (b'K', 0x58, 0x2d, false),
         (b'L', 0x10, 0x2a, false),
     ] {
-        input(target.window, source as u16, false);
-        input(target.window, source as u16, true);
-        expected.push((WM_KEYDOWN, destination, scan, extended));
-        expected.push((WM_KEYUP, destination, scan, extended));
-        target.expect_events(&expected);
+        input(target_fixture.window, source_key as u16, false);
+        input(target_fixture.window, source_key as u16, true);
+        expected_events.push((
+            WM_KEYDOWN,
+            destination_virtual_key,
+            destination_scan_code,
+            is_extended,
+        ));
+        expected_events.push((
+            WM_KEYUP,
+            destination_virtual_key,
+            destination_scan_code,
+            is_extended,
+        ));
+        target_fixture.expect_events(&expected_events);
     }
 
     // 同時押しとキーリピートでは押下状態を維持し、OFF にすると両方のキーを解放する。
-    input(target.window, b'W' as u16, false);
-    input(target.window, b'J' as u16, false);
-    input(target.window, b'W' as u16, false);
-    expected.extend([
+    input(target_fixture.window, b'W' as u16, false);
+    input(target_fixture.window, b'J' as u16, false);
+    input(target_fixture.window, b'W' as u16, false);
+    expected_events.extend([
         (WM_KEYDOWN, 0x26, 0x48, true),
         (WM_KEYDOWN, 0x5a, 0x2c, false),
         (WM_KEYDOWN, 0x26, 0x48, true),
     ]);
-    target.expect_events(&expected);
+    target_fixture.expect_events(&expected_events);
     // 安全性: 有効な仮想キーコードをコールバックの外で照会し、押下状態の最上位ビットだけを調べる。
     assert!(unsafe { GetAsyncKeyState(0x26) } < 0);
     assert!(unsafe { GetAsyncKeyState(0x5a) } < 0);
     service.set_enabled(false);
-    expected.extend([(WM_KEYUP, 0x26, 0x48, true), (WM_KEYUP, 0x5a, 0x2c, false)]);
-    target.expect_events(&expected);
-    input(target.window, b'W' as u16, true);
-    input(target.window, b'J' as u16, true);
-    target.expect_events(&expected);
+    expected_events.extend([(WM_KEYUP, 0x26, 0x48, true), (WM_KEYUP, 0x5a, 0x2c, false)]);
+    target_fixture.expect_events(&expected_events);
+    input(target_fixture.window, b'W' as u16, true);
+    input(target_fixture.window, b'J' as u16, true);
+    target_fixture.expect_events(&expected_events);
 
     // 対象ウィンドウの判定、フォーカス喪失時の解放、変換元の KeyUp の抑制を確認する。
     service.set_enabled(true);
-    input(target.window, b'L' as u16, false);
-    expected.push((WM_KEYDOWN, 0x10, 0x2a, false));
-    target.expect_events(&expected);
-    other.activate();
+    input(target_fixture.window, b'L' as u16, false);
+    expected_events.push((WM_KEYDOWN, 0x10, 0x2a, false));
+    target_fixture.expect_events(&expected_events);
+    non_target_fixture.activate();
     // 安全性: 左 Shift の有効な仮想キーコードをコールバックの外で照会する。
     wait_until(|| unsafe { GetAsyncKeyState(0xa0) } >= 0);
-    input(other.window, b'L' as u16, true);
-    input(other.window, b'W' as u16, false);
-    input(other.window, b'W' as u16, true);
-    other.expect_events(&[
+    input(non_target_fixture.window, b'L' as u16, true);
+    input(non_target_fixture.window, b'W' as u16, false);
+    input(non_target_fixture.window, b'W' as u16, true);
+    non_target_fixture.expect_events(&[
         (WM_KEYUP, 0x10, 0x2a, false),
         (WM_KEYDOWN, 0x57, 0x11, false),
         (WM_KEYUP, 0x57, 0x11, false),
     ]);
 
     // 変換先キーを押下中に終了すると、そのキーが解放され、通常の入力に戻る。
-    target.activate();
-    input(target.window, b'D' as u16, false);
-    expected.push((WM_KEYDOWN, 0x27, 0x4d, true));
-    target.expect_events(&expected);
+    target_fixture.activate();
+    input(target_fixture.window, b'D' as u16, false);
+    expected_events.push((WM_KEYDOWN, 0x27, 0x4d, true));
+    target_fixture.expect_events(&expected_events);
     drop(service);
-    expected.push((WM_KEYUP, 0x27, 0x4d, true));
-    target.expect_events(&expected);
+    expected_events.push((WM_KEYUP, 0x27, 0x4d, true));
+    target_fixture.expect_events(&expected_events);
     // 安全性: 右矢印の有効な仮想キーコードをコールバックの外で照会する。
     assert!(unsafe { GetAsyncKeyState(0x27) } >= 0);
-    input(target.window, b'D' as u16, true);
-    expected.push((WM_KEYUP, 0x44, 0x20, false));
-    target.expect_events(&expected);
+    input(target_fixture.window, b'D' as u16, true);
+    expected_events.push((WM_KEYUP, 0x44, 0x20, false));
+    target_fixture.expect_events(&expected_events);
 }
 
-/// Fixture が子プロセスで実行する受信側。環境変数で指定されたウィンドウを作り、キーイベントを記録する。
+/// InputWindowFixture が子プロセスで実行する受信側。環境変数で指定されたウィンドウを作り、キーイベントを記録する。
 #[test]
 #[ignore = "child process fixture for the explicit Windows input integration test"]
 fn input_window_fixture() {
     let Ok(title) = std::env::var("TOUHOU_TEST_TITLE") else {
         return;
     };
-    let mut log = fs::File::create(std::env::var_os("TOUHOU_TEST_LOG").unwrap()).unwrap();
+    let mut event_log = fs::File::create(std::env::var_os("TOUHOU_TEST_LOG").unwrap()).unwrap();
     let title = wide(&title);
-    let class = wide("TouhouWASDInputFixture");
+    let window_class_name = wide("TouhouWASDInputFixture");
     // 安全性: null は現在のプロセスのモジュールを指定する。返されたハンドルの所有権は取得しない。
-    let module = unsafe { GetModuleHandleW(null_mut()) };
+    let module_handle = unsafe { GetModuleHandleW(null_mut()) };
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(DefWindowProcW),
-        hInstance: module,
-        lpszClassName: class.as_ptr(),
+        hInstance: module_handle,
+        lpszClassName: window_class_name.as_ptr(),
         ..Default::default()
     };
     // 安全性: 構造体と NUL 終端のクラス名は有効で、ウィンドウプロシージャは静的な関数を指定する。
@@ -382,7 +397,7 @@ fn input_window_fixture() {
     let window = unsafe {
         CreateWindowExW(
             0,
-            class.as_ptr(),
+            window_class_name.as_ptr(),
             title.as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             20,
@@ -391,7 +406,7 @@ fn input_window_fixture() {
             130,
             null_mut(),
             null_mut(),
-            module,
+            module_handle,
             null_mut(),
         )
     };
@@ -409,7 +424,7 @@ fn input_window_fixture() {
                 WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
             ) {
                 writeln!(
-                    log,
+                    event_log,
                     "{} {} {} {}",
                     message.message,
                     message.wParam,
@@ -417,7 +432,7 @@ fn input_window_fixture() {
                     (message.lParam >> 24) & 1
                 )
                 .unwrap();
-                log.flush().unwrap();
+                event_log.flush().unwrap();
             }
             DispatchMessageW(&message);
         }

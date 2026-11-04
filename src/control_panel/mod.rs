@@ -8,16 +8,16 @@ slint::include_modules!();
 /// GUI のトグルをサービスへ接続し、ウィンドウを閉じるまでイベントループを実行する。
 pub fn run() -> Result<(), Box<dyn Error>> {
     let window = ControlPanel::new()?;
-    let remapping = Rc::new(RemappingService::start()?);
+    let remapping_service = Rc::new(RemappingService::start()?);
     // コールバックとイベントループ終了後の処理から、同じサービスの ON / OFF を変更できるよう共有する。
     window.on_enabled_changed({
-        let remapping = Rc::clone(&remapping);
-        move |enabled| remapping.set_enabled(enabled)
+        let remapping_service = Rc::clone(&remapping_service);
+        move |enabled| remapping_service.set_enabled(enabled)
     });
 
     // ウィンドウのイベントループ終了後、サービスを破棄して押下中のキーを解放する。
     window.run()?;
-    remapping.set_enabled(false);
+    remapping_service.set_enabled(false);
     Ok(())
 }
 

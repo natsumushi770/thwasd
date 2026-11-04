@@ -42,41 +42,41 @@ const INPUT_TAG: usize = 0x5448_5744;
 
 /// GUI から専用スレッドへ伝える操作要求。押下状態と Win32 リソースは専用スレッドだけで扱う。
 #[derive(Default)]
-struct Control {
-    enabled: AtomicBool,
-    stopping: AtomicBool,
+struct WorkerRequests {
+    remapping_enabled: AtomicBool,
+    stop_requested: AtomicBool,
 }
 
 /// キーボードフックを管理する。破棄時は生成したキーの解放を試み、処理スレッドの終了を待つ。
 pub struct RemappingService {
-    control: Arc<Control>,
-    worker: Option<JoinHandle<io::Result<()>>>,
+    worker_requests: Arc<WorkerRequests>,
+    worker_thread: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl RemappingService {
     /// リマップを OFF の状態で起動する。有効化は GUI から明示的に行う。
     /// フック・フォーカス監視・タイマーの導入が完了するまで待ち、導入時のエラーを返す。
     pub fn start() -> io::Result<Self> {
-        let control = Arc::new(Control::default());
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let worker = thread::Builder::new()
+        let worker_requests = Arc::new(WorkerRequests::default());
+        let (startup_result_tx, startup_result_rx) = mpsc::sync_channel(1);
+        let worker_thread = thread::Builder::new()
             .name("keyboard-remapping".into())
             .spawn({
-                let control = Arc::clone(&control);
-                move || run_worker(control, ready_tx)
+                let worker_requests = Arc::clone(&worker_requests);
+                move || run_worker(worker_requests, startup_result_tx)
             })?;
         // スレッドの生成成功とフックの導入成功は別なので、導入結果を受け取ってから戻る。
-        match ready_rx.recv() {
+        match startup_result_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                control,
-                worker: Some(worker),
+                worker_requests,
+                worker_thread: Some(worker_thread),
             }),
             Ok(Err(error)) => {
-                let _ = worker.join();
+                let _ = worker_thread.join();
                 Err(error)
             }
             Err(error) => {
-                let _ = worker.join();
+                let _ = worker_thread.join();
                 Err(io::Error::other(error.to_string()))
             }
         }
@@ -84,18 +84,24 @@ impl RemappingService {
 
     /// リマップの ON / OFF を要求する。ここでは要求を記録するだけで、入力は送らない。
     /// 実際の反映とキー解放は、専用スレッドの次の入力・フォーカス通知・タイマー処理で行う。
-    pub fn set_enabled(&self, enabled: bool) {
-        self.control.enabled.store(enabled, Ordering::Release);
+    pub fn set_enabled(&self, remapping_enabled: bool) {
+        self.worker_requests
+            .remapping_enabled
+            .store(remapping_enabled, Ordering::Release);
     }
 }
 
 impl Drop for RemappingService {
     fn drop(&mut self) {
-        self.control.enabled.store(false, Ordering::Release);
-        self.control.stopping.store(true, Ordering::Release);
+        self.worker_requests
+            .remapping_enabled
+            .store(false, Ordering::Release);
+        self.worker_requests
+            .stop_requested
+            .store(true, Ordering::Release);
         // キー入力がなくても、スレッド内のタイマーがメッセージループを起こす。
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Some(worker_thread) = self.worker_thread.take() {
+            let _ = worker_thread.join();
         }
     }
 }
@@ -106,29 +112,29 @@ thread_local! {
 }
 
 struct HookState {
-    control: Arc<Control>,
+    worker_requests: Arc<WorkerRequests>,
     remapper: Remapper,
     // 対象プロセスかどうかを判定した時点の、ウィンドウ識別値と PID。
-    foreground: Option<(usize, u32)>,
-    // foreground のプロセスが対象一覧に含まれているかをキャッシュする。
-    target: bool,
+    foreground_identity: Option<(usize, u32)>,
+    // foreground_identity のプロセスが対象一覧に含まれているかをキャッシュする。
+    foreground_is_target: bool,
 }
 
 impl HookState {
     /// 現時点の押下状態を読み、起動前から押されていたキーを途中から変換しない初期状態を作る。
-    fn new(control: Arc<Control>) -> Self {
+    fn new(worker_requests: Arc<WorkerRequests>) -> Self {
         let mut remapper = Remapper::default();
         for mapping in MAPPINGS {
             // 安全性: 有効な仮想キーコードを、低レベルフックのコールバック外で照会する。
-            if unsafe { GetAsyncKeyState(mapping.source as i32) } < 0 {
-                remapper.mark_already_held(mapping.source);
+            if unsafe { GetAsyncKeyState(mapping.source_key as i32) } < 0 {
+                remapper.mark_already_held(mapping.source_key);
             }
         }
         Self {
-            control,
+            worker_requests,
             remapper,
-            foreground: None,
-            target: false,
+            foreground_identity: None,
+            foreground_is_target: false,
         }
     }
 
@@ -137,25 +143,40 @@ impl HookState {
     /// 切り替えに伴うキー解放と、失敗していた解放の再試行も set_context 経由で行う。
     fn refresh_context(&mut self) {
         // 安全性: PID の出力先ポインターは有効であり、ウィンドウが null の場合も以下で処理する。
-        let (window, process) = unsafe {
-            let window = GetForegroundWindow();
-            let mut process = 0;
-            if !window.is_null() {
-                GetWindowThreadProcessId(window, &mut process);
+        let (foreground_window, process_id) = unsafe {
+            let foreground_window = GetForegroundWindow();
+            let mut process_id = 0;
+            if !foreground_window.is_null() {
+                GetWindowThreadProcessId(foreground_window, &mut process_id);
             }
-            (window as usize, process)
+            (foreground_window as usize, process_id)
         };
-        let identity = (window != 0 && process != 0).then_some((window, process));
-        if identity != self.foreground {
+        let foreground_identity = if foreground_window != 0 && process_id != 0 {
+            Some((foreground_window, process_id))
+        } else {
+            None
+        };
+        if foreground_identity != self.foreground_identity {
             // Windows が別プロセスにウィンドウハンドルを再利用した場合も、以前の変換状態を解除する。
             self.remapper.set_context(false, None, &mut send_output);
-            self.foreground = identity;
-            self.target = identity.is_some_and(|(_, process)| process_is_target(process));
+            self.foreground_identity = foreground_identity;
+            self.foreground_is_target = match foreground_identity {
+                Some((_, process_id)) => process_is_target(process_id),
+                None => false,
+            };
         }
-        let enabled = self.control.enabled.load(Ordering::Acquire)
-            && !self.control.stopping.load(Ordering::Acquire);
+        let remapping_enabled = self
+            .worker_requests
+            .remapping_enabled
+            .load(Ordering::Acquire)
+            && !self.worker_requests.stop_requested.load(Ordering::Acquire);
+        let target_window = if self.foreground_is_target {
+            Some(foreground_window)
+        } else {
+            None
+        };
         self.remapper
-            .set_context(enabled, self.target.then_some(window), &mut send_output);
+            .set_context(remapping_enabled, target_window, &mut send_output);
     }
 
     /// 終了時に変換を中止し、押下中の変換先キーの解放を一度試みる。
@@ -168,20 +189,25 @@ impl HookState {
 fn process_is_target(process_id: u32) -> bool {
     // 安全性: ハンドルはこのスコープ内だけで使用し、照会後に必ず閉じる。
     unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
-        if process.is_null() {
+        let process_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
+        if process_handle.is_null() {
             return false;
         }
-        let mut path = vec![0u16; 32_768];
-        let mut length = path.len() as u32;
-        let success =
-            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, path.as_mut_ptr(), &mut length);
-        CloseHandle(process);
-        if success == 0 {
+        let mut path_buffer = vec![0u16; 32_768];
+        let mut path_length = path_buffer.len() as u32;
+        let path_query_result = QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            path_buffer.as_mut_ptr(),
+            &mut path_length,
+        );
+        CloseHandle(process_handle);
+        if path_query_result == 0 {
             return false;
         }
-        let path = String::from_utf16_lossy(&path[..length as usize]);
-        path.rsplit(['\\', '/'])
+        let process_path = String::from_utf16_lossy(&path_buffer[..path_length as usize]);
+        process_path
+            .rsplit(['\\', '/'])
             .next()
             .is_some_and(is_target_process)
     }
@@ -189,91 +215,94 @@ fn process_is_target(process_id: u32) -> bool {
 
 /// 変換出力をスキャンコードの合成入力として Windows の入力列へ挿入する。
 /// 特定ウィンドウへの直接配送は行わず、Windows が 1 件の入力を受け付けた場合に true を返す。
-fn send_output(output: Output) -> bool {
-    let mut flags = KEYEVENTF_SCANCODE;
-    if output.mapping.extended {
-        flags |= KEYEVENTF_EXTENDEDKEY;
+fn send_output(output_event: Output) -> bool {
+    let mut input_flags = KEYEVENTF_SCANCODE;
+    if output_event.mapping.extended {
+        input_flags |= KEYEVENTF_EXTENDEDKEY;
     }
-    if output.state == KeyState::Up {
-        flags |= KEYEVENTF_KEYUP;
+    if output_event.key_state == KeyState::Up {
+        input_flags |= KEYEVENTF_KEYUP;
     }
-    let input = INPUT {
+    let synthetic_input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
                 wVk: 0,
-                wScan: output.mapping.scan_code,
-                dwFlags: flags,
+                wScan: output_event.mapping.scan_code,
+                dwFlags: input_flags,
                 time: 0,
                 dwExtraInfo: INPUT_TAG,
             },
         },
     };
     // 安全性: 初期化済みの INPUT と、ABI に一致する構造体サイズを渡す。
-    unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) == 1 }
+    unsafe { SendInput(1, &synthetic_input, size_of::<INPUT>() as i32) == 1 }
 }
 
 /// 自アプリの合成入力を除外し、ドメインの判断に従って元イベントを抑制または通過させる。
 /// フォーカス通知がまだ届いていない場合にも備え、元イベントの処理前に現在のフォーカスを確認する。
-unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 {
+unsafe extern "system" fn keyboard_hook(hook_code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if hook_code >= 0 {
         // 安全性: フックコードが非負の場合、Windows は有効な KBDLLHOOKSTRUCT のポインターを渡す。
-        let event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
-        let ours = event.flags & LLKHF_INJECTED != 0 && event.dwExtraInfo == INPUT_TAG;
-        if !ours {
-            let state = match wparam as u32 {
+        let keyboard_event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+        let is_own_input =
+            keyboard_event.flags & LLKHF_INJECTED != 0 && keyboard_event.dwExtraInfo == INPUT_TAG;
+        if !is_own_input {
+            let key_state = match wparam as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => Some(KeyState::Down),
                 WM_KEYUP | WM_SYSKEYUP => Some(KeyState::Up),
                 _ => None,
             };
-            if let Some(key_state) = state {
-                let suppress = HOOK_STATE.with(|cell| {
+            if let Some(key_state) = key_state {
+                let suppress_original_input = HOOK_STATE.with(|hook_state_cell| {
                     // SendInput でフックが再入する可能性がある。借用済みなら借用のパニックを避け、元イベントを通す。
-                    let Ok(mut state) = cell.try_borrow_mut() else {
+                    let Ok(mut hook_state_guard) = hook_state_cell.try_borrow_mut() else {
                         return false;
                     };
-                    let Some(state) = state.as_mut() else {
+                    let Some(hook_state) = hook_state_guard.as_mut() else {
                         return false;
                     };
-                    state.refresh_context();
-                    state
+                    hook_state.refresh_context();
+                    hook_state
                         .remapper
-                        .handle(event.vkCode, key_state, &mut send_output)
+                        .handle(keyboard_event.vkCode, key_state, &mut send_output)
                 });
-                if suppress {
+                if suppress_original_input {
                     return 1;
                 }
             }
         }
     }
     // 安全性: 未処理のイベントはそのまま次のフックへ渡す。この API は hhk を使用しない。
-    unsafe { CallNextHookEx(null_mut(), code, wparam, lparam) }
+    unsafe { CallNextHookEx(null_mut(), hook_code, wparam, lparam) }
 }
 
 /// キー入力がない間のフォーカス喪失も検知し、生成したキーの解放を試みる。
 unsafe extern "system" fn foreground_changed(
     _hook: HWINEVENTHOOK,
     _event: u32,
-    window: HWND,
+    notified_window: HWND,
     _object: i32,
     _child: i32,
     _thread: u32,
     _time: u32,
 ) {
-    HOOK_STATE.with(|cell| {
-        let Ok(mut state) = cell.try_borrow_mut() else {
+    HOOK_STATE.with(|hook_state_cell| {
+        let Ok(mut hook_state_guard) = hook_state_cell.try_borrow_mut() else {
             return;
         };
-        if let Some(state) = state.as_mut() {
-            if state
-                .foreground
-                .is_some_and(|(previous, _)| previous != window as usize)
+        if let Some(hook_state) = hook_state_guard.as_mut() {
+            if hook_state
+                .foreground_identity
+                .is_some_and(|(previous_window, _)| previous_window != notified_window as usize)
             {
                 // イベントは非同期なので、コールバック到着前にフォーカスが戻っていても、
                 // 一時的なフォーカス喪失を反映して変換状態を解除する。
-                state.remapper.set_context(false, None, &mut send_output);
+                hook_state
+                    .remapper
+                    .set_context(false, None, &mut send_output);
             }
-            state.refresh_context();
+            hook_state.refresh_context();
         }
     });
 }
@@ -282,26 +311,27 @@ unsafe extern "system" fn foreground_changed(
 /// 導入の途中で失敗しても、取得済みのリソースは Drop で解放する。
 #[derive(Default)]
 struct HookResources {
-    keyboard: HHOOK,
-    foreground: HWINEVENTHOOK,
-    timer: usize,
+    keyboard_hook: HHOOK,
+    foreground_hook: HWINEVENTHOOK,
+    timer_id: usize,
 }
 
 impl HookResources {
     /// キー入力・フォーカス変更のフックと、無入力時にも要求を処理するためのタイマーを導入する。
     fn install() -> io::Result<Self> {
-        let mut resources = Self::default();
+        let mut hook_resources = Self::default();
         // 安全性: 静的なコールバックは、メッセージループが動作している間、このスレッド上で実行される。
         unsafe {
-            let module = GetModuleHandleW(null_mut());
-            if module.is_null() {
+            let module_handle = GetModuleHandleW(null_mut());
+            if module_handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            resources.keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module, 0);
-            if resources.keyboard.is_null() {
+            hook_resources.keyboard_hook =
+                SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), module_handle, 0);
+            if hook_resources.keyboard_hook.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            resources.foreground = SetWinEventHook(
+            hook_resources.foreground_hook = SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND,
                 EVENT_SYSTEM_FOREGROUND,
                 null_mut(),
@@ -310,37 +340,37 @@ impl HookResources {
                 0,
                 WINEVENT_OUTOFCONTEXT,
             );
-            if resources.foreground.is_null() {
+            if hook_resources.foreground_hook.is_null() {
                 return Err(io::Error::last_os_error());
             }
             // 入力がなくても OFF・終了要求や失敗したキー解放を処理できるよう、定期的にループを起こす。
-            resources.timer = SetTimer(null_mut(), 0, 16, None);
-            if resources.timer == 0 {
+            hook_resources.timer_id = SetTimer(null_mut(), 0, 16, None);
+            if hook_resources.timer_id == 0 {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(resources)
+        Ok(hook_resources)
     }
 }
 
 impl Drop for HookResources {
     fn drop(&mut self) {
         // フックとタイマーを外す前に、生成したキーの解放を試みる。
-        HOOK_STATE.with(|state| {
-            if let Some(state) = state.borrow_mut().as_mut() {
-                state.stop();
+        HOOK_STATE.with(|hook_state_cell| {
+            if let Some(hook_state) = hook_state_cell.borrow_mut().as_mut() {
+                hook_state.stop();
             }
         });
         // 安全性: null でない各リソースはこのスレッド上で作成され、それぞれ一度だけ解放する。
         unsafe {
-            if self.timer != 0 {
-                KillTimer(null_mut(), self.timer);
+            if self.timer_id != 0 {
+                KillTimer(null_mut(), self.timer_id);
             }
-            if !self.foreground.is_null() {
-                UnhookWinEvent(self.foreground);
+            if !self.foreground_hook.is_null() {
+                UnhookWinEvent(self.foreground_hook);
             }
-            if !self.keyboard.is_null() {
-                UnhookWindowsHookEx(self.keyboard);
+            if !self.keyboard_hook.is_null() {
+                UnhookWindowsHookEx(self.keyboard_hook);
             }
         }
     }
@@ -348,35 +378,40 @@ impl Drop for HookResources {
 
 /// 初期化結果を呼び出し元へ返し、終了要求まで Win32 のメッセージループを動かす。
 /// フックの導入・コールバックの処理・リソースの解放を、同じ専用スレッド上で行う。
-fn run_worker(control: Arc<Control>, ready: mpsc::SyncSender<io::Result<()>>) -> io::Result<()> {
-    HOOK_STATE.with(|state| state.replace(Some(HookState::new(Arc::clone(&control)))));
-    let resources = match HookResources::install() {
-        Ok(resources) => resources,
+fn run_worker(
+    worker_requests: Arc<WorkerRequests>,
+    startup_result_tx: mpsc::SyncSender<io::Result<()>>,
+) -> io::Result<()> {
+    HOOK_STATE.with(|hook_state_cell| {
+        hook_state_cell.replace(Some(HookState::new(Arc::clone(&worker_requests))))
+    });
+    let hook_resources = match HookResources::install() {
+        Ok(hook_resources) => hook_resources,
         Err(error) => {
-            let _ = ready.send(Err(io::Error::new(error.kind(), error.to_string())));
-            HOOK_STATE.with(|state| state.replace(None));
+            let _ = startup_result_tx.send(Err(io::Error::new(error.kind(), error.to_string())));
+            HOOK_STATE.with(|hook_state_cell| hook_state_cell.replace(None));
             return Err(error);
         }
     };
-    let _ = ready.send(Ok(()));
+    let _ = startup_result_tx.send(Ok(()));
     let mut message = MSG::default();
-    let result = loop {
-        if control.stopping.load(Ordering::Acquire) {
+    let message_loop_result = loop {
+        if worker_requests.stop_requested.load(Ordering::Acquire) {
             break Ok(());
         }
         // 安全性: メッセージキューと書き込み可能な MSG は、このスレッドが所有している。
-        let status = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
+        let message_status = unsafe { GetMessageW(&mut message, null_mut(), 0, 0) };
         // -1 は取得エラー、0 は WM_QUIT による通常終了を表す。
-        if status == -1 {
+        if message_status == -1 {
             break Err(io::Error::last_os_error());
         }
-        if status == 0 {
+        if message_status == 0 {
             break Ok(());
         }
         if message.message == WM_TIMER {
-            HOOK_STATE.with(|state| {
-                if let Some(state) = state.borrow_mut().as_mut() {
-                    state.refresh_context();
+            HOOK_STATE.with(|hook_state_cell| {
+                if let Some(hook_state) = hook_state_cell.borrow_mut().as_mut() {
+                    hook_state.refresh_context();
                 }
             });
         } else {
@@ -387,7 +422,7 @@ fn run_worker(control: Arc<Control>, ready: mpsc::SyncSender<io::Result<()>>) ->
         }
     };
     // リソースの Drop が押下状態を参照するため、HOOK_STATE を消す前に解放する。
-    drop(resources);
-    HOOK_STATE.with(|state| state.replace(None));
-    result
+    drop(hook_resources);
+    HOOK_STATE.with(|hook_state_cell| hook_state_cell.replace(None));
+    message_loop_result
 }
