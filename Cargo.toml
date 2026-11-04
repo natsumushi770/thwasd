@@ -19,6 +19,7 @@ windows-sys = { version = "0.61.2", features = [
 
 [build-dependencies]
 slint-build = "=1.18.1"
+winresource = "0.1.34"
 
 [profile.release]
 lto = "thin"

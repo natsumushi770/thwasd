@@ -19,6 +19,8 @@ cargo build --release --locked
 ```
 
 生成先は `target/release/touhou-wasd.exe` です。
+紅白の陰陽玉をキーキャップに組み合わせたアイコンを、実行ファイル・タイトルバー・タスクバーに使用します。
+画像と Windows 用の複数サイズのアイコンは `assets/` にあり、ビルド時に埋め込まれるため配布時の同梱は不要です。
 
 ## 使い方
 
