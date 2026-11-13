@@ -1,0 +1,83 @@
+# v* タグの push で x86_64-pc-windows-msvc のリリースビルドを行い、
+# GitHub Release に thwasd-v<version>-x86_64.exe を添付する。
+name: Windows 実行ファイルのリリース
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    name: exe をビルドして Release に載せる
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: ソースを取得する
+        uses: actions/checkout@v7
+
+      - name: Rust 1.92.0 を導入する
+        uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: ビルドキャッシュを使う
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: タグと Cargo.toml の版を照合する
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "タグは vX.Y.Z 形式にしてください: $($env:RELEASE_TAG)"
+          }
+          $metadataLines = @(& cargo metadata --no-deps --format-version 1 --locked)
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo metadata が失敗しました"
+          }
+          $metadata = ($metadataLines -join "`n") | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object { $_.name -eq "touhou-wasd" })
+          if ($package.Count -ne 1) {
+            throw "パッケージ touhou-wasd を特定できません"
+          }
+          $version = $package[0].version
+          if ($env:RELEASE_TAG -ne "v$version") {
+            throw "タグ $($env:RELEASE_TAG) と Cargo.toml の version $version が一致しません"
+          }
+          Write-Host "タグ $env:RELEASE_TAG は Cargo.toml の version $version と一致しました"
+
+      - name: リリースビルドする
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: 配布用のファイル名にする
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asset = "thwasd-$($env:RELEASE_TAG)-x86_64.exe"
+          Copy-Item -Path "target/x86_64-pc-windows-msvc/release/touhou-wasd.exe" -Destination $asset
+          $item = Get-Item $asset
+          if ($item.Length -le 0) {
+            throw "配布ファイルが空です: $($item.FullName)"
+          }
+          Write-Host "$($item.Name) ($($item.Length) bytes)"
+
+      - name: GitHub Release にアップロードする
+        uses: softprops/action-gh-release@v3
+        with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: thwasd-${{ github.ref_name }}-x86_64.exe
+          body: |
+            Windows 10 / Windows 11（x86_64）向けの実行ファイルです。
+            `thwasd-${{ github.ref_name }}-x86_64.exe` をダウンロードして実行してください。
+            コード署名はしていないため、初回起動時に Windows の保護警告が出ることがあります。

@@ -3,6 +3,14 @@
 Windows 10 / Windows 11 向けの東方Project用キーリマップアプリです。
 Rust と Slint で実装しています。
 
+## 入手
+
+[Releases](https://github.com/natsumushi770/thwasd/releases) から、Windows 10 / Windows 11（x86_64）向けの実行ファイルをダウンロードできます。
+ファイル名は `thwasd-v0.1.0-x86_64.exe` のように、タグの版と `x86_64` を含みます。
+ダウンロードした exe を実行してください。コード署名はしていないため、初回起動時に Windows の保護警告が出ることがあります。
+
+配布は `v*` タグの push で行います。Actions が `x86_64-pc-windows-msvc` 向けに `cargo build --release --locked` し、できた exe をそのタグの Release に添付します。タグは `v0.1.0` のように `v` と `Cargo.toml` の `version` を続けた名前にしてください。
+
 ## ビルド・実行
 
 Rust 1.92 以降と Visual Studio Build Tools の「C++ によるデスクトップ開発」が必要です。
