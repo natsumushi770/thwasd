@@ -9,7 +9,10 @@ Rust と Slint で実装しています。
 ファイル名は `thwasd-v0.1.0-x86_64.exe` のように、タグの版と `x86_64` を含みます。
 ダウンロードした exe を実行してください。コード署名はしていないため、初回起動時に Windows の保護警告が出ることがあります。
 
-配布は `v*` タグの push で行います。Actions が `x86_64-pc-windows-msvc` 向けに `cargo build --release --locked` し、できた exe をそのタグの Release に添付します。タグは `v0.1.0` のように `v` と `Cargo.toml` の `version` を続けた名前にしてください。
+版を上げるときは、Actions の「版を上げてリリースする」を main で実行し、`patch`、`minor`、`major` から選びます。
+現在の `Cargo.toml` の `version` がその種別だけ上がり、main へコミットされたあと `v0.1.1` のようなタグが付きます。
+続けて `x86_64-pc-windows-msvc` 向けに `cargo build --release --locked` し、`thwasd-v0.1.1-x86_64.exe` をその Release に添付します。
+いまの版が `0.1.0` のときに `patch` を選ぶと、タグは `v0.1.1` です。
 
 ## ビルド・実行
 
