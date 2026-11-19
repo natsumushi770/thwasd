@@ -9,6 +9,7 @@ slint::include_modules!();
 pub fn run() -> Result<(), Box<dyn Error>> {
     let window = ControlPanel::new()?;
     let remapping_service = Rc::new(RemappingService::start()?);
+    remapping_service.set_enabled(window.get_remapping_enabled());
     // コールバックとイベントループ終了後の処理から、同じサービスの ON / OFF を変更できるよう共有する。
     window.on_enabled_changed({
         let remapping_service = Rc::clone(&remapping_service);
